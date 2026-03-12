@@ -1,0 +1,246 @@
+import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { loadConfig, saveConfig, resolveToken, resolveChatId } from "./config.js";
+import { startBot, stopBot, getBot, setAllowedChatId, setIncomingMessageHandler, waitForChatId, sendText, sendTyping } from "./bot.js";
+import { markdownToTelegramHtml, splitForTelegram } from "./formatter.js";
+
+export default function (pi: ExtensionAPI) {
+	let relayEnabled = false;
+	let chatId: number | null = null;
+	let botToken: string | null = null;
+
+	// ── Setup Flow ──────────────────────────────────────────────
+
+	async function runSetup(ctx: ExtensionCommandContext): Promise<boolean> {
+		// 1. Resolve bot token
+		botToken = resolveToken();
+		if (!botToken) {
+			const input = await ctx.ui.input("Enter your Telegram bot token (from @BotFather):");
+			if (!input || !input.trim()) {
+				ctx.ui.notify("Setup cancelled — no token provided", "warning");
+				return false;
+			}
+			botToken = input.trim();
+		}
+
+		// 2. Start bot
+		ctx.ui.notify("Starting Telegram bot...", "info");
+		try {
+			await startBot(botToken);
+		} catch (err: any) {
+			ctx.ui.notify(`Failed to start bot: ${err.message}`, "error");
+			botToken = null;
+			return false;
+		}
+
+		// 3. Resolve chat ID
+		chatId = resolveChatId();
+		if (!chatId) {
+			ctx.ui.notify("Send any message to your bot on Telegram to link your chat...", "info");
+			chatId = await waitForChatId();
+			ctx.ui.notify(`Chat ID discovered: ${chatId}`, "info");
+		}
+
+		// 4. Persist config
+		saveConfig({ botToken, chatId });
+		setAllowedChatId(chatId);
+
+		// 5. Wire up incoming message handler
+		wireIncomingHandler(ctx);
+
+		ctx.ui.notify(`✅ Telegram connected! Chat ID: ${chatId}`, "info");
+		return true;
+	}
+
+	function isSetUp(): boolean {
+		return getBot() !== null && chatId !== null;
+	}
+
+	// ── Incoming Message Handler ────────────────────────────────
+
+	function wireIncomingHandler(ctx: ExtensionContext) {
+		setIncomingMessageHandler((_incomingChatId, text) => {
+			if (!relayEnabled) {
+				sendText(_incomingChatId, "⚠️ Relay is disabled. Enable with /telegram in pi.");
+				return;
+			}
+
+			// Notify in TUI
+			if (ctx.hasUI) {
+				ctx.ui.notify(`📱 Telegram: ${text.length > 60 ? text.slice(0, 60) + "…" : text}`, "info");
+			}
+
+			// Send to agent
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(text);
+			} else {
+				pi.sendUserMessage(text, { deliverAs: "followUp" });
+			}
+		});
+	}
+
+	// ── Relay Toggle ────────────────────────────────────────────
+
+	async function enableRelay(ctx: ExtensionContext) {
+		relayEnabled = true;
+		pi.appendEntry("telebridge-state", { enabled: true });
+
+		if (ctx.hasUI) {
+			const theme = ctx.ui.theme;
+			ctx.ui.setStatus("telebridge", theme.fg("success", "📡 TG"));
+			ctx.ui.notify("🟢 Telegram relay enabled", "info");
+		}
+
+		if (chatId) {
+			await sendText(chatId, "📡 Connected to pi session");
+		}
+	}
+
+	async function disableRelay(ctx: ExtensionContext) {
+		relayEnabled = false;
+		pi.appendEntry("telebridge-state", { enabled: false });
+
+		if (ctx.hasUI) {
+			ctx.ui.setStatus("telebridge", undefined);
+			ctx.ui.notify("🔴 Telegram relay disabled", "info");
+		}
+
+		if (chatId) {
+			await sendText(chatId, "📴 Disconnected from pi session");
+		}
+	}
+
+	// ── Commands ────────────────────────────────────────────────
+
+	pi.registerCommand("telegram", {
+		description: "Toggle Telegram relay (setup | status | on/off)",
+		handler: async (args, ctx) => {
+			const subcommand = args?.trim().toLowerCase();
+
+			if (subcommand === "setup") {
+				await runSetup(ctx);
+				return;
+			}
+
+			if (subcommand === "status") {
+				const botRunning = getBot() !== null;
+				const lines = [
+					`Bot: ${botRunning ? "✅ running" : "❌ stopped"}`,
+					`Chat ID: ${chatId ?? "not set"}`,
+					`Relay: ${relayEnabled ? "🟢 enabled" : "🔴 disabled"}`,
+				];
+				ctx.ui.notify(lines.join("\n"), "info");
+				return;
+			}
+
+			// Toggle: set up first if needed
+			if (!isSetUp()) {
+				const ok = await runSetup(ctx);
+				if (!ok) return;
+			}
+
+			// Toggle relay
+			if (relayEnabled) {
+				await disableRelay(ctx);
+			} else {
+				await enableRelay(ctx);
+			}
+		},
+	});
+
+	// ── Session Events ──────────────────────────────────────────
+
+	pi.on("session_start", async (_event, ctx) => {
+		// Restore relay state from session entries
+		relayEnabled = false;
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type === "custom" && entry.customType === "telebridge-state") {
+				const data = (entry as { data?: { enabled?: boolean } }).data;
+				relayEnabled = data?.enabled ?? false;
+			}
+		}
+
+		// If relay was enabled, try to reconnect the bot
+		if (relayEnabled) {
+			botToken = resolveToken();
+			chatId = resolveChatId();
+
+			if (botToken && chatId) {
+				try {
+					await startBot(botToken);
+					setAllowedChatId(chatId);
+					wireIncomingHandler(ctx);
+
+					if (ctx.hasUI) {
+						const theme = ctx.ui.theme;
+						ctx.ui.setStatus("telebridge", theme.fg("success", "📡 TG"));
+					}
+				} catch {
+					relayEnabled = false;
+					if (ctx.hasUI) {
+						ctx.ui.notify("⚠️ Telebridge: failed to reconnect bot", "warning");
+					}
+				}
+			} else {
+				relayEnabled = false;
+			}
+		}
+	});
+
+	pi.on("session_shutdown", async () => {
+		if (relayEnabled && chatId) {
+			await sendText(chatId, "📴 pi session ended");
+		}
+		await stopBot();
+	});
+
+	// ── Agent → Telegram (outgoing) ─────────────────────────────
+
+	pi.on("agent_start", async () => {
+		if (relayEnabled && chatId) {
+			await sendTyping(chatId);
+		}
+	});
+
+	pi.on("agent_end", async (event) => {
+		if (!relayEnabled || !chatId) return;
+
+		// Extract the last assistant message text
+		const messages = event.messages ?? [];
+		let assistantText = "";
+
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg.role === "assistant") {
+				// Extract text content blocks
+				if (typeof msg.content === "string") {
+					assistantText = msg.content;
+				} else if (Array.isArray(msg.content)) {
+					assistantText = msg.content
+						.filter((block: any) => block.type === "text")
+						.map((block: any) => block.text)
+						.join("\n");
+				}
+				break;
+			}
+		}
+
+		if (!assistantText.trim()) return;
+
+		// Convert markdown to Telegram HTML and split if needed
+		const html = markdownToTelegramHtml(assistantText);
+		const chunks = splitForTelegram(html);
+
+		for (const chunk of chunks) {
+			try {
+				await sendText(chatId!, chunk, "HTML");
+			} catch {
+				// If HTML parsing fails, try plain text
+				try {
+					await sendText(chatId!, assistantText.slice(0, 4096));
+				} catch {
+					// Give up silently
+				}
+			}
+		}
+	});
+}

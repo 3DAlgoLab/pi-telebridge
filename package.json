@@ -1,0 +1,37 @@
+{
+  "name": "pi-telebridge",
+  "version": "1.0.0",
+  "description": "A pi extension that creates a two-way relay between your active pi coding agent session and a Telegram bot.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "telegram",
+    "telegram-bot"
+  ],
+  "author": "acarerdinc",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/acarerdinc/pi-telebridge.git"
+  },
+  "homepage": "https://github.com/acarerdinc/pi-telebridge#readme",
+  "bugs": {
+    "url": "https://github.com/acarerdinc/pi-telebridge/issues"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "dependencies": {
+    "grammy": "^1.35.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
