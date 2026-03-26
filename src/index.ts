@@ -206,11 +206,21 @@ export default function (pi: ExtensionAPI) {
 		// If input came from the TUI (not from our extension), clear the flag
 		if (event.source !== "extension") {
 			lastMessageFromTelegram = false;
+
+			// Forward local CLI input to Telegram
+			if (relayEnabled && chatId && event.text) {
+				const text = `👤 <b>You</b>: ${event.text}`;
+				try {
+					await sendText(chatId, text, "HTML");
+				} catch {
+					// Silently fail - not critical
+				}
+			}
 		}
 	});
 
 	pi.on("before_agent_start", async (event) => {
-		if (!relayEnabled || !lastMessageFromTelegram) return;
+		if (!relayEnabled) return;
 		return {
 			systemPrompt: event.systemPrompt + "\n\n" + TELEGRAM_BRIEF_INSTRUCTION,
 		};
@@ -261,14 +271,13 @@ export default function (pi: ExtensionAPI) {
 	// ── Agent → Telegram (outgoing) ─────────────────────────────
 
 	pi.on("agent_start", async () => {
-		if (relayEnabled && chatId && lastMessageFromTelegram) {
+		if (relayEnabled && chatId) {
 			await sendTyping(chatId);
 		}
 	});
 
 	pi.on("agent_end", async (event) => {
-		if (!relayEnabled || !chatId || !lastMessageFromTelegram) return;
-		lastMessageFromTelegram = false;
+		if (!relayEnabled || !chatId) return;
 
 		// Extract the last assistant message text
 		const messages = event.messages ?? [];
